@@ -1,0 +1,19 @@
+{
+  "name": "com.azzazello.resourceloader",
+  "version": "1.0.0",
+  "displayName": "ResourceLoader",
+  "description": "",
+  "unity": "2020.3",
+  "dependencies": {
+	  "com.unity.addressables": "1.21.20"
+	  },
+  "keywords": [
+    "resource",
+	"loader",
+  ],
+  "author": {
+    "name": "Azzazelloqq",
+    "email": "bog22232@ya.ru",
+    "url": "https://github.com/Azzazelloqq"
+  }
+}
