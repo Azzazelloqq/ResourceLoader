@@ -1,6 +1,6 @@
 {
     "name": "ResourceLoader",
-    "rootNamespace": "",
+    "rootNamespace": "ResourceLoader",
     "references": [
 		"Unity.Addressables",
 		"Unity.ResourceManager"
