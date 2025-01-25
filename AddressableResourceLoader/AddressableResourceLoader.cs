@@ -1,10 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Threading;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.AddressableAssets;
 using UnityEngine.ResourceManagement.AsyncOperations;
+using Component = UnityEngine.Component;
+using Object = UnityEngine.Object;
 
 namespace ResourceLoader.AddressableResourceLoader
 {
@@ -107,18 +110,58 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	}
 
 	/// <summary>
-	/// Loads a prefab asynchronously and instantiates it, returning the new instance (root GameObject).
+	/// Asynchronously loads a prefab from Addressables, instantiates it under the specified parent, 
+	/// and retrieves the requested component from the instantiated object.
 	/// </summary>
-	public async Task<GameObject> LoadAndInstantiateAsync(string resourceId, CancellationToken token = default)
+	/// <typeparam name="TComponent">The type of the component to retrieve from the instantiated prefab.</typeparam>
+	/// <typeparam name="TParent">The type of the parent to associate with the instantiated prefab. Must be either <see cref="Transform"/> or a type containing a <see cref="Transform"/> component.</typeparam>
+	/// <param name="resourceId">The identifier of the prefab to load from Addressables.</param>
+	/// <param name="parent">
+	/// The parent object under which the prefab will be instantiated. 
+	/// Can be a <see cref="Transform"/> or a <see cref="Component"/> that contains a Transform.
+	/// </param>
+	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+	/// <returns>
+	/// The requested component of type <typeparamref name="TComponent"/> from the instantiated prefab.
+	/// If the prefab does not contain the component, returns <c>default</c> and logs an error.
+	/// </returns>
+	/// <exception cref="ArgumentException">
+	/// Thrown if the provided <paramref name="parent"/> is not a valid type (neither <see cref="Transform"/> nor a <see cref="Component"/>).
+	/// </exception>
+	/// <remarks>
+	/// This method ensures that the instantiated prefab is placed under the specified parent transform if a valid parent is provided. 
+	/// If the prefab does not contain the requested component, an error is logged, and <c>default</c> is returned.
+	/// </remarks>
+	public async Task<TComponent> LoadAndCreateAsync<TComponent, TParent>(
+		string resourceId,
+		TParent parent,
+		CancellationToken token = default)
 	{
-		// We'll load a GameObject because we must instantiate a prefab.
-		var prefab = await LoadAssetAsync<GameObject>(resourceId, token);
-		if (prefab == null)
+		Transform parentTransform = null;
+		if (parent is Transform transform)
 		{
-			throw new Exception($"Failed to load prefab for instantiation: {resourceId}");
+			parentTransform = transform;
 		}
+		else if (parent is Component parentComponent)
+		{
+			parentTransform = parentComponent.transform;
+		}
+		else
+		{
+			Debug.LogError("Parent object is not have Transform component");
+		}
+		
+		var assetObject = await LoadAssetAsync<GameObject>(resourceId, token);
+		
+		var instantiateObject = Object.Instantiate(assetObject, parentTransform);
 
-		return UnityEngine.Object.Instantiate(prefab);
+		if (instantiateObject.TryGetComponent(out TComponent component))
+		{
+			return component;
+		}
+		
+		Debug.LogError($"Prefab {resourceId} does not have component {typeof(TComponent).Name}");
+		return default;
 	}
 
 	#endregion

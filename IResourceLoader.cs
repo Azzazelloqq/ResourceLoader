@@ -46,6 +46,21 @@ public interface IResourceLoader : IDisposable
 	public Task<TResource> LoadResourceAsync<TResource>(string resourceId, CancellationToken token);
 
 	/// <summary>
+	/// Asynchronously loads a resource and creates an instance of the specified component, 
+	/// associating it with the provided parent.
+	/// </summary>
+	/// <typeparam name="TComponent">The type of the component to be created from the loaded resource.</typeparam>
+	/// <typeparam name="TParent">The type of the parent object to which the created resource will be associated.</typeparam>
+	/// <param name="resourceId">The identifier of the resource to load.</param>
+	/// <param name="parent">The parent object with which the created resource will be associated.</param>
+	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+	/// <returns>The requested component created from the loaded resource.</returns>
+	Task<TComponent> LoadAndCreateAsync<TComponent, TParent>(
+		string resourceId,
+		TParent parent,
+		CancellationToken token = default);
+	
+	/// <summary>
 	/// Releases a loaded resource.
 	/// </summary>
 	/// <typeparam name="TResource">The type of the resource to release.</typeparam>
