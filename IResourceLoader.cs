@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Threading;
 using System.Threading.Tasks;
+using UnityEngine;
 
 namespace ResourceLoader
 {
@@ -16,6 +17,7 @@ public interface IResourceLoader : IDisposable
 	/// <param name="resourceId">The identifier of the resource to preload.</param>
 	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
 	public Task PreloadInCacheAsync<TResource>(string resourceId, CancellationToken token);
+	
 
 	/// <summary>
 	/// Loads a resource synchronously.
