@@ -393,36 +393,12 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	public void ReleaseResource<TResource>(TResource resource)
 	{
-		Addressables.Release(resource);
-
-		lock (_lock)
+		if (!TryTakeLoadedResource(resource, out var handle))
 		{
-			_loadedResources.RemoveAll(handle =>
-			{
-				if (handle.Result == null)
-				{
-					return false;
-				}
-
-				// If the loaded object *is* the resource, remove it
-				if (handle.Result.Equals(resource))
-				{
-					return true;
-				}
-
-				// If resource is a Component, handle.Result might be a GameObject
-				if (resource is Component cmp && handle.Result is GameObject go)
-				{
-					var c = go.GetComponent<TResource>();
-					if (c != null && c.Equals(cmp))
-					{
-						return true;
-					}
-				}
-
-				return false;
-			});
+			return;
 		}
+
+		Addressables.Release(handle);
 	}
 
 	/// <summary>
@@ -430,15 +406,64 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	public void ReleaseAllResources()
 	{
+		AsyncOperationHandle[] handles;
+
 		lock (_lock)
 		{
-			foreach (var loadedResource in _loadedResources)
-			{
-				Addressables.Release(loadedResource);
-			}
-
+			handles = _loadedResources.ToArray();
 			_loadedResources.Clear();
 		}
+
+		foreach (var handle in handles)
+		{
+			if (handle.IsValid())
+			{
+				Addressables.Release(handle);
+			}
+		}
+	}
+
+	private bool TryTakeLoadedResource<TResource>(TResource resource, out AsyncOperationHandle loadedHandle)
+	{
+		lock (_lock)
+		{
+			for (var index = 0; index < _loadedResources.Count; index++)
+			{
+				var handle = _loadedResources[index];
+				if (!handle.IsValid())
+				{
+					_loadedResources.RemoveAt(index--);
+					continue;
+				}
+
+				if (!MatchesResource(handle.Result, resource))
+				{
+					continue;
+				}
+
+				_loadedResources.RemoveAt(index);
+				loadedHandle = handle;
+				return true;
+			}
+		}
+
+		loadedHandle = default;
+		return false;
+	}
+
+	private static bool MatchesResource<TResource>(object loadedResource, TResource resource)
+	{
+		if (Equals(loadedResource, resource))
+		{
+			return true;
+		}
+
+		if (resource is Component component && loadedResource is GameObject gameObject)
+		{
+			return Equals(gameObject.GetComponent<TResource>(), component);
+		}
+
+		return false;
 	}
 
 	#endregion
