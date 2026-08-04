@@ -250,7 +250,6 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return loadedResource;
 			}
 
-			Addressables.Release(handle);
 			throw new Exception($"Failed to load resource asynchronously: {resourceId}");
 		}
 		catch
@@ -288,7 +287,6 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return component;
 			}
 
-			Addressables.Release(prefabHandle);
 			throw new Exception($"Failed to load prefab asynchronously for component: {resourceId}");
 		}
 		catch

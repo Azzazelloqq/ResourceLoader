@@ -79,6 +79,17 @@ namespace ResourceLoader.Tests
             Assert.That(secondHandle.IsValid(), Is.False);
         }
 
+        [Test]
+        public void ReleaseAllResources_WhenCalledTwice_DoesNotReleaseHandlesTwice()
+        {
+            var handle = Track(_resource);
+
+            _loader.ReleaseAllResources();
+            Assert.DoesNotThrow(_loader.ReleaseAllResources);
+
+            Assert.That(handle.IsValid(), Is.False);
+        }
+
         private AsyncOperationHandle Track(Object resource)
         {
             Assert.That(LoadedResourcesField, Is.Not.Null);
