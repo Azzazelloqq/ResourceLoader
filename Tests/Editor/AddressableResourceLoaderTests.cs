@@ -1,5 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using NUnit.Framework;
 using UnityEngine;
 using UnityEngine.AddressableAssets;
@@ -12,6 +15,9 @@ namespace ResourceLoader.Tests
     {
         private static readonly FieldInfo LoadedResourcesField = typeof(AddressableLoader)
             .GetField("_loadedResources", BindingFlags.Instance | BindingFlags.NonPublic);
+
+        private static readonly MethodInfo WaitOrCancelAsyncMethod = typeof(AddressableLoader)
+            .GetMethod("WaitOrCancelAsync", BindingFlags.Static | BindingFlags.NonPublic);
 
         private AddressableLoader _loader;
         private GameObject _resource;
@@ -27,7 +33,7 @@ namespace ResourceLoader.Tests
         public void TearDown()
         {
             _loader.Dispose();
-            Object.DestroyImmediate(_resource);
+            UnityEngine.Object.DestroyImmediate(_resource);
         }
 
         [Test]
@@ -90,7 +96,56 @@ namespace ResourceLoader.Tests
             Assert.That(handle.IsValid(), Is.False);
         }
 
-        private AsyncOperationHandle Track(Object resource)
+        [Test]
+        public async Task WaitOrCancelAsync_WhenTokenCancelledBeforeTaskCompletes_ReturnsTrueWithoutWaitingForTask()
+        {
+            var neverCompletingSource = new TaskCompletionSource<int>();
+            using var cts = new CancellationTokenSource();
+
+            var waitTask = InvokeWaitOrCancelAsync(neverCompletingSource.Task, cts.Token);
+            cts.Cancel();
+
+            var raced = await Task.WhenAny(waitTask, Task.Delay(TimeSpan.FromSeconds(5)));
+
+            Assert.That(raced, Is.SameAs(waitTask), "Cancellation must interrupt the wait instead of blocking until the task completes.");
+            Assert.That(await waitTask, Is.True);
+            Assert.That(neverCompletingSource.Task.IsCompleted, Is.False);
+        }
+
+        [Test]
+        public async Task WaitOrCancelAsync_WhenTaskCompletesBeforeCancellation_ReturnsFalse()
+        {
+            var source = new TaskCompletionSource<int>();
+            using var cts = new CancellationTokenSource();
+
+            var waitTask = InvokeWaitOrCancelAsync(source.Task, cts.Token);
+            source.SetResult(42);
+
+            Assert.That(await waitTask, Is.False);
+        }
+
+        [Test]
+        public void LoadResource_AfterDispose_ThrowsObjectDisposedException()
+        {
+            _loader.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => _loader.LoadResource<GameObject>("any"));
+        }
+
+        [Test]
+        public void LoadResource_WithCallback_AfterDispose_ThrowsObjectDisposedException()
+        {
+            _loader.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => _loader.LoadResource<GameObject>("any", _ => { }));
+        }
+
+        private static Task<bool> InvokeWaitOrCancelAsync(Task task, CancellationToken token)
+        {
+            return (Task<bool>)WaitOrCancelAsyncMethod.Invoke(null, new object[] { task, token });
+        }
+
+        private AsyncOperationHandle Track(UnityEngine.Object resource)
         {
             Assert.That(LoadedResourcesField, Is.Not.Null);
 

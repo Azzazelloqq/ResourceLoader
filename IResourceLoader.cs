@@ -16,6 +16,7 @@ public interface IResourceLoader : IDisposable
 	/// <typeparam name="TResource">The type of the resource to preload.</typeparam>
 	/// <param name="resourceId">The identifier of the resource to preload.</param>
 	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
 	public Task PreloadInCacheAsync<TResource>(string resourceId, CancellationToken token);
 	
 
@@ -43,6 +44,10 @@ public interface IResourceLoader : IDisposable
 	/// <param name="resourceId">The identifier of the resource to load.</param>
 	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
 	/// <returns>A task that represents the asynchronous load operation. The task result contains the loaded resource.</returns>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. Control returns to the caller
+	/// as soon as cancellation is requested, without waiting for the underlying load to actually finish.
+	/// </exception>
 	public Task<TResource> LoadResourceAsync<TResource>(string resourceId, CancellationToken token);
 
 	/// <summary>
@@ -55,6 +60,7 @@ public interface IResourceLoader : IDisposable
 	/// <param name="parent">The parent object with which the created resource will be associated.</param>
 	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
 	/// <returns>The requested component created from the loaded resource.</returns>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
 	Task<TComponent> LoadAndCreateAsync<TComponent, TParent>(
 		string resourceId,
 		TParent parent,

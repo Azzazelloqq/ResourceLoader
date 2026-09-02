@@ -13,7 +13,9 @@ when the loader is disposed.
 - Load a component directly from an Addressable prefab.
 - Instantiate a prefab under a `Transform` or `Component` parent.
 - Release individual resources or all tracked resources.
-- Cancellation-aware async APIs.
+- Cancellation-aware async APIs: a cancelled `CancellationToken` interrupts the `await`
+  immediately (instead of waiting for the load to finish) and throws
+  `OperationCanceledException`, so it can't be confused with a `null`/missing-asset result.
 
 ## Installation
 

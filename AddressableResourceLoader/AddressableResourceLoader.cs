@@ -24,6 +24,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 {
 	private readonly List<AsyncOperationHandle> _loadedResources;
 	private readonly object _lock = new();
+	private volatile bool _disposed;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="AddressableResourceLoader"/> class.
@@ -39,6 +40,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	public void Dispose()
 	{
+		_disposed = true;
 		ReleaseAllResources();
 	}
 
@@ -46,9 +48,10 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 
 	/// <summary>
 	/// Preloads a resource into the cache asynchronously.
-	/// If TResource is a Component, it loads the prefab (GameObject), obtains the component, 
+	/// If TResource is a Component, it loads the prefab (GameObject), obtains the component,
 	/// and caches the prefab handle.
 	/// </summary>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
 	public async Task PreloadInCacheAsync<TResource>(string resourceId, CancellationToken token)
 	{
 		// Just load it asynchronously and discard the result.
@@ -77,6 +80,11 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// - If TResource is a Component, it loads a GameObject then returns TComponent from GetComponent.
 	/// - Otherwise, it loads TResource directly.
 	/// </summary>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. The awaiting caller regains
+	/// control as soon as cancellation is requested, without waiting for the underlying Addressables
+	/// operation to actually finish; the handle is released once it does.
+	/// </exception>
 	public async Task<TResource> LoadResourceAsync<TResource>(string resourceId, CancellationToken token = default)
 	{
 		if (typeof(Component).IsAssignableFrom(typeof(TResource)))
@@ -128,6 +136,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// <exception cref="ArgumentException">
 	/// Thrown if the provided <paramref name="parent"/> is not a valid type (neither <see cref="Transform"/> nor a <see cref="Component"/>).
 	/// </exception>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
 	/// <remarks>
 	/// This method ensures that the instantiated prefab is placed under the specified parent transform if a valid parent is provided. 
 	/// If the prefab does not contain the requested component, an error is logged, and <c>default</c> is returned.
@@ -173,6 +182,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	private TResource LoadAssetSync<TResource>(string resourceId)
 	{
+		ThrowIfDisposed();
+
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		handle.WaitForCompletion();
 
@@ -198,6 +209,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	private TResource LoadComponentSync<TResource>(string resourceId)
 	{
+		ThrowIfDisposed();
+
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
 		prefabHandle.WaitForCompletion();
 
@@ -224,76 +237,126 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	#region Private Helper Methods (Async)
 
 	/// <summary>
+	/// Awaits <paramref name="task"/>, but returns as soon as <paramref name="token"/> is cancelled
+	/// instead of blocking until the underlying operation actually finishes.
+	/// </summary>
+	/// <returns><c>true</c> if <paramref name="token"/> was cancelled before <paramref name="task"/> completed.</returns>
+	private static async Task<bool> WaitOrCancelAsync(Task task, CancellationToken token)
+	{
+		if (!token.CanBeCanceled)
+		{
+			await task;
+			return false;
+		}
+
+		token.ThrowIfCancellationRequested();
+
+		var cancellationCompletionSource = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+		using var registration = token.Register(
+			static state => ((TaskCompletionSource<bool>)state).TrySetResult(true),
+			cancellationCompletionSource);
+
+		var completedTask = await Task.WhenAny(task, cancellationCompletionSource.Task);
+		return completedTask == cancellationCompletionSource.Task;
+	}
+
+	/// <summary>
 	/// Asynchronously loads a non-Component resource (e.g. ScriptableObject, AudioClip).
 	/// </summary>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. The handle is released.
+	/// </exception>
 	private async Task<TResource> LoadAssetAsync<TResource>(string resourceId, CancellationToken token)
 	{
+		ThrowIfDisposed();
+
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
+		bool cancelled;
 		try
 		{
-			await handle.Task;
-
-			if (token.IsCancellationRequested)
-			{
-				Addressables.Release(handle);
-				return default;
-			}
-
-			if (handle.Status == AsyncOperationStatus.Succeeded)
-			{
-				var loadedResource = handle.Result;
-				lock (_lock)
-				{
-					_loadedResources.Add(handle);
-				}
-
-				return loadedResource;
-			}
-
-			throw new Exception($"Failed to load resource asynchronously: {resourceId}");
+			cancelled = await WaitOrCancelAsync(handle.Task, token);
 		}
 		catch
 		{
 			Addressables.Release(handle);
 			throw;
 		}
+
+		if (cancelled)
+		{
+			Addressables.Release(handle);
+			throw new OperationCanceledException(token);
+		}
+
+		if (handle.Status == AsyncOperationStatus.Succeeded)
+		{
+			var loadedResource = handle.Result;
+			lock (_lock)
+			{
+				if (_disposed)
+				{
+					Addressables.Release(handle);
+					throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+				}
+
+				_loadedResources.Add(handle);
+			}
+
+			return loadedResource;
+		}
+
+		Addressables.Release(handle);
+		throw new Exception($"Failed to load resource asynchronously: {resourceId}");
 	}
 
 	/// <summary>
 	/// Asynchronously loads a prefab as a GameObject, then returns the requested component.
 	/// </summary>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. The handle is released.
+	/// </exception>
 	private async Task<TResource> LoadComponentAsync<TResource>(string resourceId, CancellationToken token)
 	{
+		ThrowIfDisposed();
+
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
+		bool cancelled;
 		try
 		{
-			await prefabHandle.Task;
-
-			if (token.IsCancellationRequested)
-			{
-				Addressables.Release(prefabHandle);
-				return default;
-			}
-
-			if (prefabHandle.Status == AsyncOperationStatus.Succeeded)
-			{
-				var prefab = prefabHandle.Result;
-				lock (_lock)
-				{
-					_loadedResources.Add(prefabHandle);
-				}
-
-				var component = prefab != null ? prefab.GetComponent<TResource>() : default;
-				return component;
-			}
-
-			throw new Exception($"Failed to load prefab asynchronously for component: {resourceId}");
+			cancelled = await WaitOrCancelAsync(prefabHandle.Task, token);
 		}
 		catch
 		{
 			Addressables.Release(prefabHandle);
 			throw;
 		}
+
+		if (cancelled)
+		{
+			Addressables.Release(prefabHandle);
+			throw new OperationCanceledException(token);
+		}
+
+		if (prefabHandle.Status == AsyncOperationStatus.Succeeded)
+		{
+			var prefab = prefabHandle.Result;
+			lock (_lock)
+			{
+				if (_disposed)
+				{
+					Addressables.Release(prefabHandle);
+					throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+				}
+
+				_loadedResources.Add(prefabHandle);
+			}
+
+			var component = prefab != null ? prefab.GetComponent<TResource>() : default;
+			return component;
+		}
+
+		Addressables.Release(prefabHandle);
+		throw new Exception($"Failed to load prefab asynchronously for component: {resourceId}");
 	}
 
 	/// <summary>
@@ -304,6 +367,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		Action<TResource> onResourceLoaded,
 		CancellationToken token)
 	{
+		ThrowIfDisposed();
+
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		Action<AsyncOperationHandle<TResource>> onComplete = null;
 
@@ -319,18 +384,25 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 
 			if (completedHandle.Status == AsyncOperationStatus.Succeeded)
 			{
-				var loadedResource = completedHandle.Result;
-				onResourceLoaded?.Invoke(loadedResource);
-
 				lock (_lock)
 				{
+					if (_disposed)
+					{
+						Addressables.Release(handle);
+						return;
+					}
+
 					_loadedResources.Add(handle);
 				}
+
+				onResourceLoaded?.Invoke(completedHandle.Result);
 			}
 			else
 			{
+				// Thrown from Addressables' Completed event, not an await context - a caller-visible
+				// exception can't propagate from here, so this is a log rather than a throw.
+				Debug.LogError($"Failed to load resource asynchronously: {resourceId}");
 				Addressables.Release(handle);
-				throw new Exception($"Failed to load resource asynchronously: {resourceId}");
 			}
 		};
 
@@ -345,6 +417,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		Action<TResource> onResourceLoaded,
 		CancellationToken token)
 	{
+		ThrowIfDisposed();
+
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
 		Action<AsyncOperationHandle<GameObject>> onComplete = null;
 
@@ -360,20 +434,27 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 
 			if (completedHandle.Status == AsyncOperationStatus.Succeeded)
 			{
-				var prefab = completedHandle.Result;
-				var component = prefab != null ? prefab.GetComponent<TResource>() : default;
-
-				onResourceLoaded?.Invoke(component);
-
 				lock (_lock)
 				{
+					if (_disposed)
+					{
+						Addressables.Release(prefabHandle);
+						return;
+					}
+
 					_loadedResources.Add(prefabHandle);
 				}
+
+				var prefab = completedHandle.Result;
+				var component = prefab != null ? prefab.GetComponent<TResource>() : default;
+				onResourceLoaded?.Invoke(component);
 			}
 			else
 			{
+				// Thrown from Addressables' Completed event, not an await context - a caller-visible
+				// exception can't propagate from here, so this is a log rather than a throw.
+				Debug.LogError($"Failed to load prefab asynchronously (component): {resourceId}");
 				Addressables.Release(prefabHandle);
-				throw new Exception($"Failed to load prefab asynchronously (component): {resourceId}");
 			}
 		};
 
@@ -447,6 +528,14 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 
 		loadedHandle = default;
 		return false;
+	}
+
+	private void ThrowIfDisposed()
+	{
+		if (_disposed)
+		{
+			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+		}
 	}
 
 	private static bool MatchesResource<TResource>(object loadedResource, TResource resource)
