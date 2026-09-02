@@ -65,7 +65,45 @@ public interface IResourceLoader : IDisposable
 		string resourceId,
 		TParent parent,
 		CancellationToken token = default);
-	
+
+	/// <summary>
+	/// Loads a resource asynchronously and returns an exclusive lease over it. Disposing the
+	/// lease releases the underlying Addressables handle.
+	/// </summary>
+	/// <typeparam name="TResource">The type of the resource to load.</typeparam>
+	/// <param name="resourceId">The identifier of the resource to load.</param>
+	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+	/// <returns>A lease owning the loaded resource.</returns>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. Control returns to the caller
+	/// as soon as cancellation is requested, without waiting for the underlying load to actually finish.
+	/// </exception>
+	Task<IResourceLease<TResource>> LoadResourceLeaseAsync<TResource>(string resourceId, CancellationToken token = default);
+
+	/// <summary>
+	/// Asynchronously loads a prefab, instantiates it under the specified parent, and returns an
+	/// exclusive lease over the instantiated component. Disposing the lease destroys the
+	/// instantiated object and releases the underlying Addressables handle.
+	/// </summary>
+	/// <typeparam name="TComponent">
+	/// The type of the component to retrieve from the instantiated prefab. May be a
+	/// <see cref="UnityEngine.Component"/> type or an interface it implements.
+	/// </typeparam>
+	/// <typeparam name="TParent">The type of the parent to associate with the instantiated prefab. Must be either <see cref="UnityEngine.Transform"/> or a type containing a <see cref="UnityEngine.Transform"/> component, or <c>null</c> for no parent.</typeparam>
+	/// <param name="resourceId">The identifier of the prefab to load from Addressables.</param>
+	/// <param name="parent">The parent object under which the prefab will be instantiated, or <c>null</c>.</param>
+	/// <param name="token">A cancellation token to observe while waiting for the task to complete.</param>
+	/// <returns>A lease owning the instantiated component.</returns>
+	/// <exception cref="ArgumentException">
+	/// <paramref name="parent"/> is neither <c>null</c>, a <see cref="UnityEngine.Transform"/>, nor a <see cref="UnityEngine.Component"/>.
+	/// </exception>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
+	Task<IInstanceLease<TComponent>> LoadInstanceLeaseAsync<TComponent, TParent>(
+		string resourceId,
+		TParent parent,
+		CancellationToken token = default)
+		where TComponent : class;
+
 	/// <summary>
 	/// Releases a loaded resource.
 	/// </summary>

@@ -18,7 +18,9 @@ namespace ResourceLoader.AddressableResourceLoader
 /// - If TResource is a Component, loads the prefab as a GameObject, then calls GetComponent<TResource>().
 /// - If TResource is not a Component, loads the asset directly as TResource.
 /// - Provides synchronous and asynchronous methods for loading, plus a method for load & instantiate.
-/// - Uses refactored private methods to reduce duplication of logic.
+/// - Lease-based <see cref="LoadResourceLeaseAsync{TResource}"/>/<see cref="LoadInstanceLeaseAsync{TComponent,TParent}"/>
+///   return an <see cref="IDisposable"/> that owns exactly one handle (and, for instances, the
+///   spawned object); prefer them over <see cref="ReleaseResource{TResource}"/>'s value-matching.
 /// </summary>
 public class AddressableResourceLoader : IResourceLoader, IDisposable
 {
@@ -173,6 +175,65 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		return default;
 	}
 
+	/// <summary>
+	/// Loads a resource asynchronously and returns an exclusive lease over it. Disposing the
+	/// lease releases the underlying Addressables handle.
+	/// </summary>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
+	public async Task<IResourceLease<TResource>> LoadResourceLeaseAsync<TResource>(
+		string resourceId,
+		CancellationToken token = default)
+	{
+		var (handle, resource) = await LoadAssetHandleAsync<TResource>(resourceId, token);
+		return new ResourceLeaseImpl<TResource>(this, handle, resource);
+	}
+
+	/// <summary>
+	/// Asynchronously loads a prefab, instantiates it under the specified parent, and returns an
+	/// exclusive lease over the instantiated component. Disposing the lease destroys the
+	/// instantiated object and releases the underlying Addressables handle.
+	/// </summary>
+	/// <exception cref="ArgumentException">
+	/// <paramref name="parent"/> is neither <c>null</c>, a <see cref="Transform"/>, nor a <see cref="Component"/>.
+	/// </exception>
+	/// <exception cref="OperationCanceledException"><paramref name="token"/> was cancelled before the load finished.</exception>
+	public async Task<IInstanceLease<TComponent>> LoadInstanceLeaseAsync<TComponent, TParent>(
+		string resourceId,
+		TParent parent,
+		CancellationToken token = default)
+		where TComponent : class
+	{
+		var parentTransform = ResolveParentTransform(parent);
+
+		var (handle, prefab) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
+
+		if (prefab == null)
+		{
+			if (Untrack(handle))
+			{
+				Addressables.Release(handle);
+			}
+
+			throw new Exception($"Prefab {resourceId} loaded as null.");
+		}
+
+		var instance = Object.Instantiate(prefab, parentTransform);
+
+		if (!instance.TryGetComponent(out TComponent component))
+		{
+			Object.Destroy(instance);
+
+			if (Untrack(handle))
+			{
+				Addressables.Release(handle);
+			}
+
+			throw new Exception($"Instantiated prefab {resourceId} does not have component {typeof(TComponent).Name}.");
+		}
+
+		return new InstanceLeaseImpl<TComponent>(this, handle, instance, component);
+	}
+
 	#endregion
 
 	#region Private Helper Methods (Sync)
@@ -187,21 +248,19 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		handle.WaitForCompletion();
 
-		if (handle.Status == AsyncOperationStatus.Succeeded)
-		{
-			var loadedResource = handle.Result;
-			lock (_lock)
-			{
-				_loadedResources.Add(handle);
-			}
-
-			return loadedResource;
-		}
-		else
+		if (handle.Status != AsyncOperationStatus.Succeeded)
 		{
 			Addressables.Release(handle);
 			throw new Exception($"Failed to load resource synchronously: {resourceId}");
 		}
+
+		if (!TryTrack(handle))
+		{
+			Addressables.Release(handle);
+			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+		}
+
+		return handle.Result;
 	}
 
 	/// <summary>
@@ -214,22 +273,20 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
 		prefabHandle.WaitForCompletion();
 
-		if (prefabHandle.Status == AsyncOperationStatus.Succeeded)
-		{
-			var prefab = prefabHandle.Result;
-			lock (_lock)
-			{
-				_loadedResources.Add(prefabHandle);
-			}
-
-			var component = prefab != null ? prefab.GetComponent<TResource>() : default;
-			return component;
-		}
-		else
+		if (prefabHandle.Status != AsyncOperationStatus.Succeeded)
 		{
 			Addressables.Release(prefabHandle);
 			throw new Exception($"Failed to load prefab synchronously for component: {resourceId}");
 		}
+
+		if (!TryTrack(prefabHandle))
+		{
+			Addressables.Release(prefabHandle);
+			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+		}
+
+		var prefab = prefabHandle.Result;
+		return prefab != null ? prefab.GetComponent<TResource>() : default;
 	}
 
 	#endregion
@@ -261,12 +318,18 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	}
 
 	/// <summary>
-	/// Asynchronously loads a non-Component resource (e.g. ScriptableObject, AudioClip).
+	/// Loads a resource asynchronously and, on success, tracks its handle in <see cref="_loadedResources"/>.
+	/// Shared by every async load path (typed result, component, callback, lease).
 	/// </summary>
 	/// <exception cref="OperationCanceledException">
 	/// <paramref name="token"/> was cancelled before the load finished. The handle is released.
 	/// </exception>
-	private async Task<TResource> LoadAssetAsync<TResource>(string resourceId, CancellationToken token)
+	/// <exception cref="ObjectDisposedException">
+	/// The loader was disposed while this load was in flight. The handle is released.
+	/// </exception>
+	private async Task<(AsyncOperationHandle Handle, TResource Resource)> LoadAssetHandleAsync<TResource>(
+		string resourceId,
+		CancellationToken token)
 	{
 		ThrowIfDisposed();
 
@@ -288,25 +351,31 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 			throw new OperationCanceledException(token);
 		}
 
-		if (handle.Status == AsyncOperationStatus.Succeeded)
+		if (handle.Status != AsyncOperationStatus.Succeeded)
 		{
-			var loadedResource = handle.Result;
-			lock (_lock)
-			{
-				if (_disposed)
-				{
-					Addressables.Release(handle);
-					throw new ObjectDisposedException(nameof(AddressableResourceLoader));
-				}
-
-				_loadedResources.Add(handle);
-			}
-
-			return loadedResource;
+			Addressables.Release(handle);
+			throw new Exception($"Failed to load resource asynchronously: {resourceId}");
 		}
 
-		Addressables.Release(handle);
-		throw new Exception($"Failed to load resource asynchronously: {resourceId}");
+		if (!TryTrack(handle))
+		{
+			Addressables.Release(handle);
+			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+		}
+
+		return (handle, handle.Result);
+	}
+
+	/// <summary>
+	/// Asynchronously loads a non-Component resource (e.g. ScriptableObject, AudioClip).
+	/// </summary>
+	/// <exception cref="OperationCanceledException">
+	/// <paramref name="token"/> was cancelled before the load finished. The handle is released.
+	/// </exception>
+	private async Task<TResource> LoadAssetAsync<TResource>(string resourceId, CancellationToken token)
+	{
+		var (_, resource) = await LoadAssetHandleAsync<TResource>(resourceId, token);
+		return resource;
 	}
 
 	/// <summary>
@@ -317,46 +386,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </exception>
 	private async Task<TResource> LoadComponentAsync<TResource>(string resourceId, CancellationToken token)
 	{
-		ThrowIfDisposed();
-
-		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
-		bool cancelled;
-		try
-		{
-			cancelled = await WaitOrCancelAsync(prefabHandle.Task, token);
-		}
-		catch
-		{
-			Addressables.Release(prefabHandle);
-			throw;
-		}
-
-		if (cancelled)
-		{
-			Addressables.Release(prefabHandle);
-			throw new OperationCanceledException(token);
-		}
-
-		if (prefabHandle.Status == AsyncOperationStatus.Succeeded)
-		{
-			var prefab = prefabHandle.Result;
-			lock (_lock)
-			{
-				if (_disposed)
-				{
-					Addressables.Release(prefabHandle);
-					throw new ObjectDisposedException(nameof(AddressableResourceLoader));
-				}
-
-				_loadedResources.Add(prefabHandle);
-			}
-
-			var component = prefab != null ? prefab.GetComponent<TResource>() : default;
-			return component;
-		}
-
-		Addressables.Release(prefabHandle);
-		throw new Exception($"Failed to load prefab asynchronously for component: {resourceId}");
+		var (_, prefab) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
+		return prefab != null ? prefab.GetComponent<TResource>() : default;
 	}
 
 	/// <summary>
@@ -382,28 +413,22 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return;
 			}
 
-			if (completedHandle.Status == AsyncOperationStatus.Succeeded)
-			{
-				lock (_lock)
-				{
-					if (_disposed)
-					{
-						Addressables.Release(handle);
-						return;
-					}
-
-					_loadedResources.Add(handle);
-				}
-
-				onResourceLoaded?.Invoke(completedHandle.Result);
-			}
-			else
+			if (completedHandle.Status != AsyncOperationStatus.Succeeded)
 			{
 				// Thrown from Addressables' Completed event, not an await context - a caller-visible
 				// exception can't propagate from here, so this is a log rather than a throw.
 				Debug.LogError($"Failed to load resource asynchronously: {resourceId}");
 				Addressables.Release(handle);
+				return;
 			}
+
+			if (!TryTrack(handle))
+			{
+				Addressables.Release(handle);
+				return;
+			}
+
+			onResourceLoaded?.Invoke(completedHandle.Result);
 		};
 
 		handle.Completed += onComplete;
@@ -432,30 +457,24 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return;
 			}
 
-			if (completedHandle.Status == AsyncOperationStatus.Succeeded)
-			{
-				lock (_lock)
-				{
-					if (_disposed)
-					{
-						Addressables.Release(prefabHandle);
-						return;
-					}
-
-					_loadedResources.Add(prefabHandle);
-				}
-
-				var prefab = completedHandle.Result;
-				var component = prefab != null ? prefab.GetComponent<TResource>() : default;
-				onResourceLoaded?.Invoke(component);
-			}
-			else
+			if (completedHandle.Status != AsyncOperationStatus.Succeeded)
 			{
 				// Thrown from Addressables' Completed event, not an await context - a caller-visible
 				// exception can't propagate from here, so this is a log rather than a throw.
 				Debug.LogError($"Failed to load prefab asynchronously (component): {resourceId}");
 				Addressables.Release(prefabHandle);
+				return;
 			}
+
+			if (!TryTrack(prefabHandle))
+			{
+				Addressables.Release(prefabHandle);
+				return;
+			}
+
+			var prefab = completedHandle.Result;
+			var component = prefab != null ? prefab.GetComponent<TResource>() : default;
+			onResourceLoaded?.Invoke(component);
 		};
 
 		prefabHandle.Completed += onComplete;
@@ -538,6 +557,75 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		}
 	}
 
+	/// <summary>
+	/// Tracks <paramref name="handle"/> in <see cref="_loadedResources"/> so <see cref="ReleaseAllResources"/>
+	/// and <see cref="Dispose"/> can release it. Returns <c>false</c> without tracking it if the loader
+	/// has already been disposed - callers must release the handle themselves in that case.
+	/// </summary>
+	private bool TryTrack(AsyncOperationHandle handle)
+	{
+		lock (_lock)
+		{
+			if (_disposed)
+			{
+				return false;
+			}
+
+			_loadedResources.Add(handle);
+			return true;
+		}
+	}
+
+	/// <summary>
+	/// Removes <paramref name="handle"/> from <see cref="_loadedResources"/> if it is still tracked there.
+	/// <see cref="_loadedResources"/> membership is the single ownership token for a tracked handle:
+	/// whichever caller actually removes it - a lease's own <c>Dispose()</c>, or <see cref="ReleaseAllResources"/>
+	/// racing it - is the one responsible for calling <c>Addressables.Release</c>. Returns <c>false</c>
+	/// (meaning "someone else already claimed it, do not release it again") if it was already removed.
+	/// </summary>
+	private bool Untrack(AsyncOperationHandle handle)
+	{
+		lock (_lock)
+		{
+			for (var index = 0; index < _loadedResources.Count; index++)
+			{
+				if (_loadedResources[index].Equals(handle))
+				{
+					_loadedResources.RemoveAt(index);
+					return true;
+				}
+			}
+		}
+
+		return false;
+	}
+
+	/// <summary>
+	/// Resolves the <see cref="Transform"/> to instantiate under from a <see cref="Transform"/>,
+	/// a <see cref="Component"/> that has one, or <c>null</c> for no parent.
+	/// </summary>
+	private static Transform ResolveParentTransform<TParent>(TParent parent)
+	{
+		if (parent is Transform transform)
+		{
+			return transform;
+		}
+
+		if (parent is Component parentComponent)
+		{
+			return parentComponent.transform;
+		}
+
+		if (parent is null)
+		{
+			return null;
+		}
+
+		throw new ArgumentException(
+			$"Parent of type {typeof(TParent).Name} does not provide a Transform.",
+			nameof(parent));
+	}
+
 	private static bool MatchesResource<TResource>(object loadedResource, TResource resource)
 	{
 		if (Equals(loadedResource, resource))
@@ -551,6 +639,90 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		}
 
 		return false;
+	}
+
+	#endregion
+
+	#region Leases
+
+	/// <summary>
+	/// Disposing releases <see cref="_handle"/> at most once. <c>_disposed</c> guards against this
+	/// lease's own <c>Dispose()</c> running twice; <see cref="Untrack"/>'s return value guards against
+	/// <see cref="ReleaseAllResources"/>/<see cref="AddressableResourceLoader.Dispose"/> having already
+	/// claimed and released the same handle first - only whichever side actually removes it from
+	/// <see cref="_loadedResources"/> is allowed to release it.
+	/// </summary>
+	private sealed class ResourceLeaseImpl<TResource> : IResourceLease<TResource>
+	{
+		private readonly AddressableResourceLoader _owner;
+		private readonly AsyncOperationHandle _handle;
+		private int _disposed;
+
+		public TResource Resource { get; }
+
+		public ResourceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle, TResource resource)
+		{
+			_owner = owner;
+			_handle = handle;
+			Resource = resource;
+		}
+
+		public void Dispose()
+		{
+			if (Interlocked.Exchange(ref _disposed, 1) != 0)
+			{
+				return;
+			}
+
+			if (_owner.Untrack(_handle))
+			{
+				Addressables.Release(_handle);
+			}
+		}
+	}
+
+	/// <summary>
+	/// Disposing always destroys the instantiated object, and releases <see cref="_handle"/> at most
+	/// once. <c>_disposed</c> guards against this lease's own <c>Dispose()</c> running twice;
+	/// <see cref="Untrack"/>'s return value guards against <see cref="ReleaseAllResources"/>/
+	/// <see cref="AddressableResourceLoader.Dispose"/> having already claimed and released the same
+	/// handle first - only whichever side actually removes it from <see cref="_loadedResources"/> is
+	/// allowed to release it.
+	/// </summary>
+	private sealed class InstanceLeaseImpl<TComponent> : IInstanceLease<TComponent>
+	{
+		private readonly AddressableResourceLoader _owner;
+		private readonly AsyncOperationHandle _handle;
+		private readonly GameObject _instance;
+		private int _disposed;
+
+		public TComponent Instance { get; }
+
+		public InstanceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle, GameObject instance, TComponent instanceComponent)
+		{
+			_owner = owner;
+			_handle = handle;
+			_instance = instance;
+			Instance = instanceComponent;
+		}
+
+		public void Dispose()
+		{
+			if (Interlocked.Exchange(ref _disposed, 1) != 0)
+			{
+				return;
+			}
+
+			if (_instance != null)
+			{
+				Object.Destroy(_instance);
+			}
+
+			if (_owner.Untrack(_handle))
+			{
+				Addressables.Release(_handle);
+			}
+		}
 	}
 
 	#endregion
