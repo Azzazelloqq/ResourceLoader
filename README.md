@@ -19,6 +19,8 @@ when the loader is disposed.
 - Lease-based loading (`LoadResourceLeaseAsync`/`LoadInstanceLeaseAsync`) returns an
   `IDisposable` that owns exactly one handle, instead of matching resources back to a
   handle by value in `ReleaseResource`.
+- `ResourceLifetime` groups ownership for a plain C# owner or a `GameObject`.
+- An optional Editor generator produces grouped string address constants.
 
 ## Installation
 
@@ -31,6 +33,14 @@ Or add to `Packages/manifest.json`:
 ```json
 "com.azzazello.resourceloader": "https://github.com/Azzazelloqq/ResourceLoader.git"
 ```
+
+To try the preview in one project, pin that project's Git dependency to the prerelease tag:
+
+```json
+"com.azzazello.resourceloader": "https://github.com/Azzazelloqq/ResourceLoader.git#v1.3.0-beta.1"
+```
+
+The tag does not change projects that track another tag or an existing submodule commit.
 
 The module requires `com.unity.addressables` and supports Unity `2020.3` and newer.
 
@@ -95,8 +105,52 @@ view.Instance.Show();
 an interface implemented by the prefab's component, not just the component type itself.
 
 If a lease is never disposed, `ReleaseAllResources()`/`Dispose()` on the loader still
-release its handle as a safety net - but for an instance lease, only the handle; the
-instantiated `GameObject` is destroyed only by disposing the lease itself.
+release its handle as a safety net. Lifetime-owned instance leases also destroy their
+instances and keep each prefab handle until that instance's `OnDestroy` callback.
+
+## Owner lifetimes
+
+Create one lifetime per owner period. Every acquisition belongs to the specified lifetime;
+closing one lifetime never releases another consumer's acquisition.
+
+```csharp
+using var lifetime = new ResourceLifetime();
+var config = await loader.LoadResourceForLifetimeAsync<ScriptableObject>(
+    "GameConfig", lifetime, cancellationToken);
+// lifetime.Dispose() releases this owner's resource hold.
+```
+
+For early release, request a lease owned by the lifetime:
+
+```csharp
+var lease = await loader.LoadResourceLeaseForLifetimeAsync<ScriptableObject>(
+    "GameConfig", lifetime, cancellationToken);
+lease.Dispose();
+```
+
+Use `ResourceLifetime.For(gameObject)` to get a lifetime that closes when that object is
+destroyed. A plain C# owner using the separate `Disposable` module can register one lifetime
+with `CompositeDisposable.AddDisposable(lifetime)`; ResourceLoader does not require that module.
+
+Lifetime calls live in additive `IResourceLifetimeLoader`; existing `IResourceLoader`
+implementations remain valid. Existing bare loads and `ReleaseResource` remain available for
+source compatibility. New lifetime/lease acquisitions are not matched by the legacy
+`ReleaseResource(resource)` method.
+
+## Address code generation
+
+Create **ResourceLoader/Address Generator Settings** in the Unity asset menu, then open
+**Tools/ResourceLoader/Address Generator**. Configure groups, separators, identifier casing,
+namespace, and output file. Preview checks collisions before Generate writes a `.cs` file.
+The generated members are `const string` values containing the original Addressables
+addresses; the generator does not change Addressables settings.
+
+## Tests
+
+The Editor integration tests create a temporary texture and prefab, load them through
+Addressables, then remove the assets. They require built Addressables content in the test
+project; without it, those tests are skipped. The other EditMode tests run without a
+catalog. The temporary assets are never added to the project's Addressables groups.
 
 ## Lifetime
 

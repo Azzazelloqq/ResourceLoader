@@ -16,6 +16,9 @@ namespace ResourceLoader.Tests
         private static readonly FieldInfo LoadedResourcesField = typeof(AddressableLoader)
             .GetField("_loadedResources", BindingFlags.Instance | BindingFlags.NonPublic);
 
+        private static readonly FieldInfo LeasedResourcesField = typeof(AddressableLoader)
+            .GetField("_leasedResources", BindingFlags.Instance | BindingFlags.NonPublic);
+
         private static readonly MethodInfo WaitOrCancelAsyncMethod = typeof(AddressableLoader)
             .GetMethod("WaitOrCancelAsync", BindingFlags.Static | BindingFlags.NonPublic);
 
@@ -30,12 +33,14 @@ namespace ResourceLoader.Tests
 
         private AddressableLoader _loader;
         private GameObject _resource;
+		private long _nextTestLeaseId;
 
         [SetUp]
         public void SetUp()
         {
             _loader = new AddressableLoader();
             _resource = new GameObject("ResourceLoaderTestResource");
+			_nextTestLeaseId = 0;
         }
 
         [TearDown]
@@ -187,6 +192,117 @@ namespace ResourceLoader.Tests
         }
 
         [Test]
+        public void Lifetime_Dispose_ReleasesOnlyItsOwnLease()
+        {
+            var first = Track(_resource);
+            var second = Track(_resource);
+            using var firstLifetime = new ResourceLifetime();
+            using var secondLifetime = new ResourceLifetime();
+            firstLifetime.Add(CreateResourceLeaseForObject(first, _resource));
+            secondLifetime.Add(CreateResourceLeaseForObject(second, _resource));
+
+            firstLifetime.Dispose();
+
+            Assert.That(first.IsValid(), Is.False);
+            Assert.That(second.IsValid(), Is.True);
+            secondLifetime.Dispose();
+            Assert.That(second.IsValid(), Is.False);
+        }
+
+        [Test]
+        public void LegacyRelease_DoesNotTakeLifetimeOwnedHandleWithSameResource()
+        {
+            var legacy = Track(_resource);
+            var owned = Addressables.ResourceManager.CreateCompletedOperation(_resource, null);
+            var ownedId = TrackOwned(owned);
+            using var lifetime = new ResourceLifetime();
+            lifetime.Add(CreateResourceLeaseForObject(owned, _resource, ownedId));
+
+            _loader.ReleaseResource(_resource);
+
+            Assert.That(legacy.IsValid(), Is.False);
+            Assert.That(owned.IsValid(), Is.True);
+            lifetime.Dispose();
+            Assert.That(owned.IsValid(), Is.False);
+        }
+
+        [Test]
+        public void EqualHandles_FromSeparateAcquisitions_KeepIndependentLifetimeHolds()
+        {
+            var first = Addressables.ResourceManager.CreateCompletedOperation(_resource, null);
+            var second = Addressables.ResourceManager.Acquire(first);
+            Assert.That(second, Is.EqualTo(first));
+            var firstId = TrackOwned(first);
+            var secondId = TrackOwned(second);
+            using var firstLifetime = new ResourceLifetime();
+            using var secondLifetime = new ResourceLifetime();
+            firstLifetime.Add(CreateResourceLeaseForObject(first, _resource, firstId));
+            secondLifetime.Add(CreateResourceLeaseForObject(second, _resource, secondId));
+
+            firstLifetime.Dispose();
+            Assert.That(second.IsValid(), Is.True);
+
+            secondLifetime.Dispose();
+            Assert.That(second.IsValid(), Is.False);
+        }
+
+        [Test]
+        public void EqualHandles_LegacyLeaseCannotReleaseLifetimeHold()
+        {
+            var legacy = Addressables.ResourceManager.CreateCompletedOperation(_resource, null);
+            var owned = Addressables.ResourceManager.Acquire(legacy);
+            ((List<AsyncOperationHandle>)LoadedResourcesField.GetValue(_loader)).Add(legacy);
+            var ownedId = TrackOwned(owned);
+            var legacyLease = CreateResourceLease(legacy, _resource);
+            using var lifetime = new ResourceLifetime();
+            lifetime.Add(CreateResourceLeaseForObject(owned, _resource, ownedId));
+
+            legacyLease.Dispose();
+            Assert.That(owned.IsValid(), Is.True);
+
+            lifetime.Dispose();
+            Assert.That(owned.IsValid(), Is.False);
+        }
+
+        [Test]
+        public void Lifetime_EarlyLeaseDispose_DoesNotRetainRegistration()
+        {
+            var handle = Track(_resource);
+            using var lifetime = new ResourceLifetime();
+            var lease = lifetime.Add(CreateResourceLeaseForObject(handle, _resource));
+            lease.Dispose();
+
+            Assert.That(handle.IsValid(), Is.False);
+            Assert.That(lifetime.IsDisposed, Is.False);
+            Assert.DoesNotThrow(lifetime.Dispose);
+        }
+
+        [Test]
+        public void Lifetime_AddAfterDispose_DisposesLeaseAndThrows()
+        {
+            var handle = Track(_resource);
+            using var lifetime = new ResourceLifetime();
+            lifetime.Dispose();
+
+            Assert.Throws<ObjectDisposedException>(() => lifetime.Add(CreateResourceLeaseForObject(handle, _resource)));
+            Assert.That(handle.IsValid(), Is.False);
+        }
+
+        [Test]
+        public void GameObjectLifetime_DestroyImmediate_ClosesLifetime()
+        {
+            var owner = new GameObject("Owner");
+            var lifetime = ResourceLifetime.For(owner);
+            var handle = Track(_resource);
+            lifetime.Add(CreateResourceLeaseForObject(handle, _resource));
+
+            UnityEngine.Object.DestroyImmediate(owner);
+
+            Assert.That(lifetime.IsDisposed, Is.True);
+            Assert.That(handle.IsValid(), Is.False);
+        }
+
+        [Test]
         public void ResolveParentTransform_WithTransform_ReturnsIt()
         {
             var transform = _resource.transform;
@@ -232,12 +348,24 @@ namespace ResourceLoader.Tests
             return (Transform)closedMethod.Invoke(null, new object[] { parent });
         }
 
-        private IDisposable CreateResourceLease<TResource>(AsyncOperationHandle handle, TResource resource)
+        private IDisposable CreateResourceLease<TResource>(AsyncOperationHandle handle, TResource resource, long leaseId = 0)
         {
             var closedType = ResourceLeaseOpenType.MakeGenericType(typeof(TResource));
             var constructor = closedType.GetConstructors(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)[0];
-            return (IDisposable)constructor.Invoke(new object[] { _loader, handle, resource });
+            return (IDisposable)constructor.Invoke(new object[] { _loader, handle, resource, leaseId });
         }
+
+        private IResourceLease<GameObject> CreateResourceLeaseForObject(AsyncOperationHandle handle, GameObject resource, long leaseId = 0)
+        {
+            return (IResourceLease<GameObject>)CreateResourceLease(handle, resource, leaseId);
+        }
+
+		private long TrackOwned(AsyncOperationHandle handle)
+		{
+			var id = ++_nextTestLeaseId;
+			((Dictionary<long, AsyncOperationHandle>)LeasedResourcesField.GetValue(_loader)).Add(id, handle);
+			return id;
+		}
 
         private AsyncOperationHandle Track(UnityEngine.Object resource)
         {

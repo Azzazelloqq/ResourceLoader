@@ -3,6 +3,7 @@
     "rootNamespace": "ResourceLoader.Tests",
     "references": [
         "ResourceLoader",
+        "ResourceLoader.Editor",
         "Unity.Addressables",
         "Unity.ResourceManager",
         "UnityEngine.TestRunner",

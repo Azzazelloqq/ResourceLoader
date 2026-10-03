@@ -1,0 +1,7 @@
+{
+  "name": "ResourceLoader.Editor",
+  "rootNamespace": "ResourceLoader.Editor",
+  "references": ["ResourceLoader", "Unity.Addressables.Editor"],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": true
+}

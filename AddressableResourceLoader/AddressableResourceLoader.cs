@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Threading;
@@ -22,11 +22,16 @@ namespace ResourceLoader.AddressableResourceLoader
 ///   return an <see cref="IDisposable"/> that owns exactly one handle (and, for instances, the
 ///   spawned object); prefer them over <see cref="ReleaseResource{TResource}"/>'s value-matching.
 /// </summary>
-public class AddressableResourceLoader : IResourceLoader, IDisposable
+public class AddressableResourceLoader : IResourceLifetimeLoader, IDisposable
 {
 	private readonly List<AsyncOperationHandle> _loadedResources;
+	// Each acquisition gets its own key even when Addressables returns equal handles.
+	private readonly Dictionary<long, AsyncOperationHandle> _leasedResources = new Dictionary<long, AsyncOperationHandle>();
+	private long _nextLeaseId;
+	private readonly HashSet<IDisposable> _instanceLeases = new HashSet<IDisposable>();
 	private readonly object _lock = new();
 	private volatile bool _disposed;
+	private int _generation;
 
 	/// <summary>
 	/// Initializes a new instance of the <see cref="AddressableResourceLoader"/> class.
@@ -184,8 +189,52 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		string resourceId,
 		CancellationToken token = default)
 	{
-		var (handle, resource) = await LoadAssetHandleAsync<TResource>(resourceId, token);
-		return new ResourceLeaseImpl<TResource>(this, handle, resource);
+		// Preserve the original value-release behavior for callers of this existing API.
+		var (handle, resource, _) = await LoadAssetHandleAsync<TResource>(resourceId, token);
+		return new ResourceLeaseImpl<TResource>(this, handle, resource, 0);
+	}
+
+	/// <summary>Loads a resource owned by a lifetime. The returned value is valid until that lifetime closes.</summary>
+	public async Task<TResource> LoadResourceForLifetimeAsync<TResource>(string resourceId,
+		ResourceLifetime lifetime, CancellationToken token = default)
+	{
+		var lease = await LoadResourceLeaseForLifetimeAsync<TResource>(resourceId, lifetime, token);
+		return lease.Resource;
+	}
+
+	public async Task<IResourceLease<TResource>> LoadResourceLeaseForLifetimeAsync<TResource>(
+		string resourceId, ResourceLifetime lifetime, CancellationToken token = default)
+	{
+		if (lifetime == null) throw new ArgumentNullException(nameof(lifetime));
+		lifetime.ClosedToken.ThrowIfCancellationRequested();
+		using var linked = LinkTokens(token, lifetime.ClosedToken);
+		var lease = await LoadLifetimeResourceLeaseAsync<TResource>(resourceId,
+			linked?.Token ?? lifetime.ClosedToken);
+		if (lifetime.IsDisposed)
+		{
+			lease.Dispose();
+			throw new OperationCanceledException(lifetime.ClosedToken);
+		}
+		try { return lifetime.Add(lease); }
+		catch (ObjectDisposedException) { throw new OperationCanceledException(lifetime.ClosedToken); }
+	}
+
+	private async Task<IResourceLease<TResource>> LoadLifetimeResourceLeaseAsync<TResource>(
+		string resourceId, CancellationToken token)
+	{
+		if (!typeof(Component).IsAssignableFrom(typeof(TResource)))
+		{
+			var (assetHandle, asset, leaseId) = await LoadAssetHandleAsync<TResource>(resourceId, token, true);
+			return new ResourceLeaseImpl<TResource>(this, assetHandle, asset, leaseId);
+		}
+		var (handle, prefab, id) = await LoadAssetHandleAsync<GameObject>(resourceId, token, true);
+		var component = prefab != null ? prefab.GetComponent<TResource>() : default;
+		if (component is null)
+		{
+			ReleaseTrackedLeased(id);
+			throw new InvalidOperationException($"Prefab '{resourceId}' has no component {typeof(TResource).Name}.");
+		}
+		return new ResourceLeaseImpl<TResource>(this, handle, component, id);
 	}
 
 	/// <summary>
@@ -204,34 +253,104 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		where TComponent : class
 	{
 		var parentTransform = ResolveParentTransform(parent);
+		var (handle, prefab, _) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
+		if (prefab == null)
+		{
+			ReleaseTracked(handle);
+			throw new Exception($"Prefab {resourceId} loaded as null.");
+		}
+		var instance = Object.Instantiate(prefab, parentTransform);
+		if (!instance.TryGetComponent(out TComponent component))
+		{
+			Object.Destroy(instance);
+			ReleaseTracked(handle);
+			throw new Exception($"Instantiated prefab {resourceId} does not have component {typeof(TComponent).Name}.");
+		}
+		return new LegacyInstanceLeaseImpl<TComponent>(this, handle, instance, component);
+	}
 
-		var (handle, prefab) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
+	private async Task<IInstanceLease<TComponent>> LoadOwnedInstanceLeaseAsync<TComponent, TParent>(
+		string resourceId, TParent parent, CancellationToken token) where TComponent : class
+	{
+		var parentTransform = ResolveParentTransform(parent);
+
+		var (handle, prefab, leaseId) = await LoadAssetHandleAsync<GameObject>(resourceId, token, true);
 
 		if (prefab == null)
 		{
-			if (Untrack(handle))
-			{
-				Addressables.Release(handle);
-			}
+			ReleaseTrackedLeased(leaseId);
 
 			throw new Exception($"Prefab {resourceId} loaded as null.");
 		}
 
-		var instance = Object.Instantiate(prefab, parentTransform);
-
-		if (!instance.TryGetComponent(out TComponent component))
+		GameObject instance = null;
+		bool releaseOnDestroy = false;
+		try
 		{
-			Object.Destroy(instance);
-
-			if (Untrack(handle))
+			instance = Object.Instantiate(prefab, parentTransform);
+			var anchor = instance.GetComponent<InstanceReleaseAnchor>();
+			if (anchor == null) anchor = instance.AddComponent<InstanceReleaseAnchor>();
+			if (!instance.TryGetComponent(out TComponent component))
 			{
-				Addressables.Release(handle);
+				anchor.Initialize(() => ReleaseTrackedLeased(leaseId));
+				releaseOnDestroy = true;
+				DestroyOwnedInstance(instance);
+				throw new InvalidOperationException($"Instantiated prefab '{resourceId}' has no component {typeof(TComponent).Name}.");
 			}
-
-			throw new Exception($"Instantiated prefab {resourceId} does not have component {typeof(TComponent).Name}.");
+			var lease = new InstanceLeaseImpl<TComponent>(this, leaseId, instance, component);
+			anchor.Initialize(lease.OnDestroyed);
+			releaseOnDestroy = true;
+			bool registered;
+			lock (_lock)
+			{
+				registered = _leasedResources.ContainsKey(leaseId);
+				if (registered) _instanceLeases.Add(lease);
+			}
+			if (!registered)
+			{
+				DestroyOwnedInstance(instance);
+				throw new OperationCanceledException("Resources were released before the instance was registered.");
+			}
+			return lease;
 		}
+		catch
+		{
+			if (!releaseOnDestroy)
+			{
+				if (instance != null) DestroyOwnedInstance(instance);
+				ReleaseTrackedLeased(leaseId);
+			}
+			throw;
+		}
+	}
 
-		return new InstanceLeaseImpl<TComponent>(this, handle, instance, component);
+	public async Task<IInstanceLease<TComponent>> LoadInstanceLeaseForLifetimeAsync<TComponent, TParent>(
+		string resourceId, TParent parent, ResourceLifetime lifetime, CancellationToken token = default)
+		where TComponent : class
+	{
+		if (lifetime == null) throw new ArgumentNullException(nameof(lifetime));
+		lifetime.ClosedToken.ThrowIfCancellationRequested();
+		using var linked = LinkTokens(token, lifetime.ClosedToken);
+		var lease = await LoadOwnedInstanceLeaseAsync<TComponent, TParent>(resourceId, parent,
+			linked?.Token ?? lifetime.ClosedToken);
+		if (lifetime.IsDisposed)
+		{
+			lease.Dispose();
+			throw new OperationCanceledException(lifetime.ClosedToken);
+		}
+		try { return lifetime.Add(lease); }
+		catch (ObjectDisposedException) { throw new OperationCanceledException(lifetime.ClosedToken); }
+	}
+
+	private static CancellationTokenSource LinkTokens(CancellationToken caller, CancellationToken lifetime)
+	{
+		return caller.CanBeCanceled ? CancellationTokenSource.CreateLinkedTokenSource(caller, lifetime) : null;
+	}
+
+	private static void DestroyOwnedInstance(GameObject instance)
+	{
+		if (Application.isPlaying) Object.Destroy(instance);
+		else Object.DestroyImmediate(instance);
 	}
 
 	#endregion
@@ -244,6 +363,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	private TResource LoadAssetSync<TResource>(string resourceId)
 	{
 		ThrowIfDisposed();
+		int generation;
+		lock (_lock) generation = _generation;
 
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		handle.WaitForCompletion();
@@ -254,7 +375,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 			throw new Exception($"Failed to load resource synchronously: {resourceId}");
 		}
 
-		if (!TryTrack(handle))
+		if (!TryTrack(handle, generation))
 		{
 			Addressables.Release(handle);
 			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
@@ -269,6 +390,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	private TResource LoadComponentSync<TResource>(string resourceId)
 	{
 		ThrowIfDisposed();
+		int generation;
+		lock (_lock) generation = _generation;
 
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
 		prefabHandle.WaitForCompletion();
@@ -279,7 +402,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 			throw new Exception($"Failed to load prefab synchronously for component: {resourceId}");
 		}
 
-		if (!TryTrack(prefabHandle))
+		if (!TryTrack(prefabHandle, generation))
 		{
 			Addressables.Release(prefabHandle);
 			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
@@ -327,11 +450,14 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// <exception cref="ObjectDisposedException">
 	/// The loader was disposed while this load was in flight. The handle is released.
 	/// </exception>
-	private async Task<(AsyncOperationHandle Handle, TResource Resource)> LoadAssetHandleAsync<TResource>(
+	private async Task<(AsyncOperationHandle Handle, TResource Resource, long LeaseId)> LoadAssetHandleAsync<TResource>(
 		string resourceId,
-		CancellationToken token)
+		CancellationToken token,
+		bool leased = false)
 	{
 		ThrowIfDisposed();
+		int generation;
+		lock (_lock) generation = _generation;
 
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		bool cancelled;
@@ -341,13 +467,13 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		}
 		catch
 		{
-			Addressables.Release(handle);
+			ReleaseOnCompletion(handle);
 			throw;
 		}
 
 		if (cancelled)
 		{
-			Addressables.Release(handle);
+			ReleaseOnCompletion(handle);
 			throw new OperationCanceledException(token);
 		}
 
@@ -357,13 +483,31 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 			throw new Exception($"Failed to load resource asynchronously: {resourceId}");
 		}
 
-		if (!TryTrack(handle))
+		long leaseId = 0;
+		if (!(leased ? TryTrackLease(handle, generation, out leaseId) : TryTrack(handle, generation)))
 		{
 			Addressables.Release(handle);
-			throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+			if (_disposed) throw new ObjectDisposedException(nameof(AddressableResourceLoader));
+			throw new OperationCanceledException("Resources were released before this load completed.");
 		}
 
-		return (handle, handle.Result);
+		return (handle, handle.Result, leaseId);
+	}
+
+	private static void ReleaseOnCompletion<TResource>(AsyncOperationHandle<TResource> handle)
+	{
+		if (handle.IsDone)
+		{
+			Addressables.Release(handle);
+			return;
+		}
+		Action<AsyncOperationHandle<TResource>> onCompleted = null;
+		onCompleted = completed =>
+		{
+			completed.Completed -= onCompleted;
+			Addressables.Release(completed);
+		};
+		handle.Completed += onCompleted;
 	}
 
 	/// <summary>
@@ -374,7 +518,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </exception>
 	private async Task<TResource> LoadAssetAsync<TResource>(string resourceId, CancellationToken token)
 	{
-		var (_, resource) = await LoadAssetHandleAsync<TResource>(resourceId, token);
+		var (_, resource, _) = await LoadAssetHandleAsync<TResource>(resourceId, token);
 		return resource;
 	}
 
@@ -386,7 +530,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </exception>
 	private async Task<TResource> LoadComponentAsync<TResource>(string resourceId, CancellationToken token)
 	{
-		var (_, prefab) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
+		var (_, prefab, _) = await LoadAssetHandleAsync<GameObject>(resourceId, token);
 		return prefab != null ? prefab.GetComponent<TResource>() : default;
 	}
 
@@ -399,6 +543,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		CancellationToken token)
 	{
 		ThrowIfDisposed();
+		int generation;
+		lock (_lock) generation = _generation;
 
 		var handle = Addressables.LoadAssetAsync<TResource>(resourceId);
 		Action<AsyncOperationHandle<TResource>> onComplete = null;
@@ -422,7 +568,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return;
 			}
 
-			if (!TryTrack(handle))
+			if (!TryTrack(handle, generation))
 			{
 				Addressables.Release(handle);
 				return;
@@ -443,6 +589,8 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		CancellationToken token)
 	{
 		ThrowIfDisposed();
+		int generation;
+		lock (_lock) generation = _generation;
 
 		var prefabHandle = Addressables.LoadAssetAsync<GameObject>(resourceId);
 		Action<AsyncOperationHandle<GameObject>> onComplete = null;
@@ -466,7 +614,7 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return;
 			}
 
-			if (!TryTrack(prefabHandle))
+			if (!TryTrack(prefabHandle, generation))
 			{
 				Addressables.Release(prefabHandle);
 				return;
@@ -504,12 +652,36 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// </summary>
 	public void ReleaseAllResources()
 	{
+		IDisposable[] instances;
+		lock (_lock)
+		{
+			_generation++;
+			instances = new IDisposable[_instanceLeases.Count];
+			_instanceLeases.CopyTo(instances);
+		}
+		foreach (var instance in instances) instance.Dispose();
+
 		AsyncOperationHandle[] handles;
 
 		lock (_lock)
 		{
-			handles = _loadedResources.ToArray();
+			var releasable = new List<AsyncOperationHandle>(_loadedResources.Count + _leasedResources.Count);
+			releasable.AddRange(_loadedResources);
+			var instanceHolds = new HashSet<long>();
+			foreach (var instance in _instanceLeases)
+			{
+				if (instance is ITrackedInstance tracked) instanceHolds.Add(tracked.LeaseId);
+			}
+			foreach (var pair in _leasedResources)
+			{
+				if (!instanceHolds.Contains(pair.Key)) releasable.Add(pair.Value);
+			}
+			handles = releasable.ToArray();
 			_loadedResources.Clear();
+			var completed = new List<long>();
+			foreach (var id in _leasedResources.Keys)
+				if (!instanceHolds.Contains(id)) completed.Add(id);
+			foreach (var id in completed) _leasedResources.Remove(id);
 		}
 
 		foreach (var handle in handles)
@@ -562,16 +734,31 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	/// and <see cref="Dispose"/> can release it. Returns <c>false</c> without tracking it if the loader
 	/// has already been disposed - callers must release the handle themselves in that case.
 	/// </summary>
-	private bool TryTrack(AsyncOperationHandle handle)
+	private bool TryTrack(AsyncOperationHandle handle, int generation = -1)
 	{
 		lock (_lock)
 		{
-			if (_disposed)
+			if (_disposed || (generation >= 0 && generation != _generation))
 			{
 				return false;
 			}
 
 			_loadedResources.Add(handle);
+			return true;
+		}
+	}
+
+	private bool TryTrackLease(AsyncOperationHandle handle, int generation, out long leaseId)
+	{
+		lock (_lock)
+		{
+			if (_disposed || generation != _generation)
+			{
+				leaseId = 0;
+				return false;
+			}
+			leaseId = ++_nextLeaseId;
+			_leasedResources.Add(leaseId, handle);
 			return true;
 		}
 	}
@@ -598,6 +785,31 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 		}
 
 		return false;
+	}
+
+	private bool UntrackLeased(long leaseId, out AsyncOperationHandle handle)
+	{
+		lock (_lock)
+		{
+			if (!_leasedResources.TryGetValue(leaseId, out handle)) return false;
+			_leasedResources.Remove(leaseId);
+			return true;
+		}
+	}
+
+	private void ReleaseTracked(AsyncOperationHandle handle)
+	{
+		if (Untrack(handle) && handle.IsValid()) Addressables.Release(handle);
+	}
+
+	private void ReleaseTrackedLeased(long leaseId)
+	{
+		if (UntrackLeased(leaseId, out var handle) && handle.IsValid()) Addressables.Release(handle);
+	}
+
+	private void UnregisterInstance(IDisposable lease)
+	{
+		lock (_lock) _instanceLeases.Remove(lease);
 	}
 
 	/// <summary>
@@ -646,24 +858,22 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 	#region Leases
 
 	/// <summary>
-	/// Disposing releases <see cref="_handle"/> at most once. <c>_disposed</c> guards against this
-	/// lease's own <c>Dispose()</c> running twice; <see cref="Untrack"/>'s return value guards against
-	/// <see cref="ReleaseAllResources"/>/<see cref="AddressableResourceLoader.Dispose"/> having already
-	/// claimed and released the same handle first - only whichever side actually removes it from
-	/// <see cref="_loadedResources"/> is allowed to release it.
+	/// Disposing removes this acquisition's exact ownership record, if still present.
 	/// </summary>
 	private sealed class ResourceLeaseImpl<TResource> : IResourceLease<TResource>
 	{
 		private readonly AddressableResourceLoader _owner;
 		private readonly AsyncOperationHandle _handle;
+		private readonly long _leaseId;
 		private int _disposed;
 
 		public TResource Resource { get; }
 
-		public ResourceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle, TResource resource)
+		public ResourceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle, TResource resource, long leaseId)
 		{
 			_owner = owner;
 			_handle = handle;
+			_leaseId = leaseId;
 			Resource = resource;
 		}
 
@@ -674,34 +884,53 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 				return;
 			}
 
-			if (_owner.Untrack(_handle))
-			{
-				Addressables.Release(_handle);
-			}
+			if (_leaseId != 0) _owner.ReleaseTrackedLeased(_leaseId);
+			else _owner.ReleaseTracked(_handle);
 		}
 	}
 
 	/// <summary>
-	/// Disposing always destroys the instantiated object, and releases <see cref="_handle"/> at most
-	/// once. <c>_disposed</c> guards against this lease's own <c>Dispose()</c> running twice;
-	/// <see cref="Untrack"/>'s return value guards against <see cref="ReleaseAllResources"/>/
-	/// <see cref="AddressableResourceLoader.Dispose"/> having already claimed and released the same
-	/// handle first - only whichever side actually removes it from <see cref="_loadedResources"/> is
-	/// allowed to release it.
+	/// Instance holds stay alive until their GameObject has actually been destroyed.
 	/// </summary>
-	private sealed class InstanceLeaseImpl<TComponent> : IInstanceLease<TComponent>
+	private interface ITrackedInstance { long LeaseId { get; } }
+
+	private sealed class LegacyInstanceLeaseImpl<TComponent> : IInstanceLease<TComponent>
 	{
 		private readonly AddressableResourceLoader _owner;
 		private readonly AsyncOperationHandle _handle;
 		private readonly GameObject _instance;
 		private int _disposed;
-
 		public TComponent Instance { get; }
-
-		public InstanceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle, GameObject instance, TComponent instanceComponent)
+		public LegacyInstanceLeaseImpl(AddressableResourceLoader owner, AsyncOperationHandle handle,
+			GameObject instance, TComponent component)
 		{
 			_owner = owner;
 			_handle = handle;
+			_instance = instance;
+			Instance = component;
+		}
+		public void Dispose()
+		{
+			if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+			if (_instance != null) Object.Destroy(_instance);
+			_owner.ReleaseTracked(_handle);
+		}
+	}
+
+	private sealed class InstanceLeaseImpl<TComponent> : IInstanceLease<TComponent>, ITrackedInstance
+	{
+		private readonly AddressableResourceLoader _owner;
+		private readonly long _leaseId;
+		private readonly GameObject _instance;
+		private int _disposed;
+		public long LeaseId => _leaseId;
+
+		public TComponent Instance { get; }
+
+		public InstanceLeaseImpl(AddressableResourceLoader owner, long leaseId, GameObject instance, TComponent instanceComponent)
+		{
+			_owner = owner;
+			_leaseId = leaseId;
 			_instance = instance;
 			Instance = instanceComponent;
 		}
@@ -715,13 +944,16 @@ public class AddressableResourceLoader : IResourceLoader, IDisposable
 
 			if (_instance != null)
 			{
-				Object.Destroy(_instance);
+				DestroyOwnedInstance(_instance);
 			}
+			else OnDestroyed();
+		}
 
-			if (_owner.Untrack(_handle))
-			{
-				Addressables.Release(_handle);
-			}
+		public void OnDestroyed()
+		{
+			Interlocked.Exchange(ref _disposed, 1);
+			_owner.UnregisterInstance(this);
+			_owner.ReleaseTrackedLeased(_leaseId);
 		}
 	}
 
