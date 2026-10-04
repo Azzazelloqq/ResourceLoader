@@ -1,12 +1,19 @@
 {
   "name": "com.azzazello.resourceloader",
-  "version": "1.3.0-beta.1",
+  "version": "1.3.0-beta.2",
   "displayName": "ResourceLoader",
   "description": "",
   "unity": "2020.3",
   "dependencies": {
 	  "com.unity.addressables": "1.21.20"
 	  },
+  "samples": [
+    {
+      "displayName": "ResourceLoader Examples",
+      "description": "Runtime ownership examples and an Editor address-generator preview.",
+      "path": "Samples~/ResourceLoaderExamples"
+    }
+  ],
   "keywords": [
     "resource",
 	"loader"

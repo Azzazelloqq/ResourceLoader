@@ -1,0 +1,7 @@
+{
+  "name": "ResourceLoader.Examples.Editor",
+  "rootNamespace": "ResourceLoader.Examples.Editor",
+  "references": ["ResourceLoader.Editor"],
+  "includePlatforms": ["Editor"],
+  "autoReferenced": false
+}

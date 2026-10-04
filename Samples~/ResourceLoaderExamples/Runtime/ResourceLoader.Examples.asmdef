@@ -1,0 +1,6 @@
+{
+  "name": "ResourceLoader.Examples",
+  "rootNamespace": "ResourceLoader.Examples",
+  "references": ["ResourceLoader"],
+  "autoReferenced": false
+}

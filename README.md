@@ -37,7 +37,7 @@ Or add to `Packages/manifest.json`:
 To try the preview in one project, pin that project's Git dependency to the prerelease tag:
 
 ```json
-"com.azzazello.resourceloader": "https://github.com/Azzazelloqq/ResourceLoader.git#v1.3.0-beta.1"
+"com.azzazello.resourceloader": "https://github.com/Azzazelloqq/ResourceLoader.git#v1.3.0-beta.2"
 ```
 
 The tag does not change projects that track another tag or an existing submodule commit.
@@ -144,6 +144,11 @@ Create **ResourceLoader/Address Generator Settings** in the Unity asset menu, th
 namespace, and output file. Preview checks collisions before Generate writes a `.cs` file.
 The generated members are `const string` values containing the original Addressables
 addresses; the generator does not change Addressables settings.
+
+The generator is a Unity Editor command that writes a regular `.cs` file, not a
+Roslyn source generator. The optional **ResourceLoader Examples** sample in Package
+Manager demonstrates the runtime APIs and the generator preview in separate
+assemblies. It uses literal addresses and includes no generated ID file.
 
 ## Tests
 
